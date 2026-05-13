@@ -206,6 +206,8 @@ class WhisperApp(ctk.CTk):
         self._tray_rec      = False
         self._tray_running  = True
         self._current_tab   = "log"
+        self._log_entries   = []
+        self._editing_word  = None
 
         LANG_LABELS = {
             "auto":             "🌐 Авто (Whisper)",
@@ -246,7 +248,8 @@ class WhisperApp(ctk.CTk):
     def _load_settings(self) -> dict:
         d = {"hotkey": "win+ctrl", "language": "auto",
              "beam_size": 5, "min_dur": 0.5,
-             "device": "cuda", "compute": "float16"}
+             "device": "cuda", "compute": "float16",
+             "whisper_model": "turbo"}
         if os.path.exists(SET_FILE):
             with open(SET_FILE, "r", encoding="utf-8") as f:
                 d.update(json.load(f))
@@ -434,21 +437,13 @@ class WhisperApp(ctk.CTk):
         vsbtn(tb, "Очистить", self._clear_log, width=80
               ).pack(side="right", padx=(0, 4), pady=4)
 
-        self.log_box = ctk.CTkTextbox(
-            page,
-            font=ctk.CTkFont("Consolas", 14),
-            fg_color=C["bg"], text_color=C["text"],
-            border_width=0, corner_radius=0,
-            wrap="word", state="disabled",
-            activate_scrollbars=True)
-        self.log_box.pack(fill="both", expand=True)
-
-        tb2 = self.log_box._textbox
-        tb2.tag_config("time", foreground=C["text_faint"])
-        tb2.tag_config("lang", foreground=C["accent2"])
-        tb2.tag_config("text", foreground=C["text"])
-        tb2.tag_config("sys",  foreground=C["text_dim"])
-        tb2.tag_config("err",  foreground=C["red"])
+        self._log_scroll = ctk.CTkScrollableFrame(
+            page, fg_color=C["bg"], corner_radius=0,
+            scrollbar_button_color=C["input"],
+            scrollbar_button_hover_color=C["active"])
+        self._log_scroll.pack(fill="both", expand=True)
+        # Keep a list of (lang, text) for copy-all
+        self._log_entries = []
 
     def _append_log(self, lang: str, text: str):
         now    = datetime.now().strftime("%H:%M:%S")
@@ -460,29 +455,81 @@ class WhisperApp(ctk.CTk):
             self._sb_words.configure(text=str(self._total_words))
             self._sb_lang.configure(text=lang.upper())
 
-        self.log_box.configure(state="normal")
-        tb = self.log_box._textbox
-        tag = "sys" if lang == "sys" else ("err" if lang == "ERR" else "text")
-        tb.insert("end", f"{now}  ", "time")
+        self._log_entries.append((lang, now, text))
+
+        # Row container
+        row = ctk.CTkFrame(self._log_scroll, fg_color="transparent", corner_radius=4)
+        row.pack(fill="x", padx=4, pady=1)
+        row.bind("<Enter>", lambda e, r=row: r.configure(fg_color=C["hover"]))
+        row.bind("<Leave>", lambda e, r=row: r.configure(fg_color="transparent"))
+
+        # Timestamp (фиксированная ширина)
+        time_lbl = ctk.CTkLabel(
+            row, text=now, width=68,
+            font=ctk.CTkFont("Consolas", 12),
+            text_color=C["text_faint"], anchor="w")
+        time_lbl.pack(side="left", padx=(6, 0))
+
+        # Lang badge (фиксированная ширина)
         if not is_sys:
-            tb.insert("end", f"[{lang}]  ", "lang")
-        tb.insert("end", text + "\n", tag)
-        self.log_box.see("end")
-        self.log_box.configure(state="disabled")
+            badge_color = C["accent2"] if lang != "ERR" else C["red"]
+            lang_lbl = ctk.CTkLabel(
+                row, text=f"[{lang}]", width=42,
+                font=ctk.CTkFont("Consolas", 12),
+                text_color=badge_color, anchor="w")
+            lang_lbl.pack(side="left", padx=(4, 0))
+
+        # Text label (создаём, но НЕ пакуем сразу)
+        text_color = C["text_dim"] if is_sys else (C["red"] if lang == "ERR" else C["text"])
+        text_lbl = ctk.CTkLabel(
+            row, text=text,
+            font=ctk.CTkFont("Consolas", 13),
+            text_color=text_color, anchor="w", justify="left")
+
+        # ✅ 1. Сначала пакуем кнопку ВПРАВО. Tkinter сразу резервирует под неё место.
+        if not is_sys:
+            copy_btn = ctk.CTkLabel(
+                row, text="⎘", width=24,
+                font=ctk.CTkFont("Consolas", 14),
+                text_color=C["text_faint"], cursor="hand2")
+            copy_btn.pack(side="right", padx=(0, 6))
+            copy_btn.bind("<Button-1>", lambda e, t=text: pyperclip.copy(t))
+            copy_btn.bind("<Enter>", lambda e, w=copy_btn: w.configure(text_color=C["accent"]))
+            copy_btn.bind("<Leave>", lambda e, w=copy_btn: w.configure(text_color=C["text_faint"]))
+
+        # ✅ 2. Текст пакуем ПОСЛЕДНИМ. Он займёт только оставшееся пространство.
+        text_lbl.pack(side="left", padx=(6, 0), fill="x", expand=True)
+
+        # ✅ 3. Динамический расчёт wraplength при любом ресайзе
+        def _update_wrap(evt):
+            # evt.width — актуальная ширина строки
+            # Вычитаем: время(~70) + язык(~45) + кнопка(~30) + отступы(~25)
+            available = evt.width - 170
+            if available > 50:  # Защита от отрицательных значений при узком окне
+                text_lbl.configure(wraplength=available)
+        row.bind("<Configure>", _update_wrap)
+
+        # Auto-scroll
+        self._log_scroll._parent_canvas.yview_moveto(1.0)
 
     def _clear_log(self):
-        self.log_box.configure(state="normal")
-        self.log_box.delete("1.0", "end")
-        self.log_box.configure(state="disabled")
+        for w in self._log_scroll.winfo_children():
+            w.destroy()
+        self._log_entries.clear()
         self._total_count = 0; self._total_words = 0
         self._sb_count.configure(text="0")
         self._sb_words.configure(text="0")
         self._sb_lang.configure(text="—")
 
     def _copy_all_log(self):
-        txt = self.log_box.get("1.0", "end").strip()
-        if txt:
-            pyperclip.copy(txt)
+        lines = []
+        for lang, now, text in self._log_entries:
+            if lang in ("sys", "ERR"):
+                lines.append(f"{now}  {text}")
+            else:
+                lines.append(f"{now}  [{lang}]  {text}")
+        if lines:
+            pyperclip.copy("\n".join(lines))
 
     # ══════════════════════════════════════════════════════════════════
     #  СТРАНИЦА: СЛОВАРЬ
@@ -507,8 +554,15 @@ class WhisperApp(ctk.CTk):
         self._dv = vsentry(row, 300, "радли, редли, radley")
         self._dv.pack(side="left", padx=(6, 12))
 
-        vsbtn(row, "Добавить", self._dict_add, width=90,
-              accent=True).pack(side="left")
+        self._dict_add_btn = vsbtn(row, "Добавить", self._dict_add, width=90,
+                                   accent=True)
+        self._dict_add_btn.pack(side="left")
+
+        # Cancel edit button (hidden by default)
+        self._dict_cancel_btn = vsbtn(row, "Отмена", self._dict_cancel_edit,
+                                      width=80, danger=True)
+        # Track which word is being edited
+        self._editing_word: str | None = None
 
         lbl(page,
             "  // варианты через запятую — все способы написания этого слова",
@@ -558,18 +612,55 @@ class WhisperApp(ctk.CTk):
             x.bind("<Enter>", lambda e, w=x: w.configure(text_color=C["red"]))
             x.bind("<Leave>", lambda e, w=x: w.configure(text_color=C["text_faint"]))
 
+            # Edit button
+            ed = ctk.CTkLabel(row, text="✎", width=24,
+                               font=ctk.CTkFont("Consolas", 13),
+                               text_color=C["text_faint"], cursor="hand2")
+            ed.pack(side="right", padx=(0, 2))
+            ed.bind("<Button-1>", lambda e, c=correct, v=variants: self._dict_edit_fill(c, v))
+            ed.bind("<Enter>", lambda e, w=ed: w.configure(text_color=C["accent"]))
+            ed.bind("<Leave>", lambda e, w=ed: w.configure(text_color=C["text_faint"]))
+
             vsep(self._dict_list).pack(fill="x", padx=4)
+
+    def _dict_edit_fill(self, word: str, variants: list):
+        """Fill the form with existing word data for editing."""
+        self._editing_word = word
+        self._dw.delete(0, "end")
+        self._dw.insert(0, word)
+        self._dw.configure(state="disabled")  # Word key can't be changed during edit
+        self._dv.delete(0, "end")
+        self._dv.insert(0, ", ".join(variants))
+        self._dict_add_btn.configure(text="Сохранить")
+        self._dict_cancel_btn.pack(side="left", padx=(6, 0))
+
+    def _dict_cancel_edit(self):
+        """Cancel edit mode and reset form."""
+        self._editing_word = None
+        self._dw.configure(state="normal")
+        self._dw.delete(0, "end")
+        self._dv.delete(0, "end")
+        self._dict_add_btn.configure(text="Добавить")
+        self._dict_cancel_btn.pack_forget()
 
     def _dict_add(self):
         word     = self._dw.get().strip()
         variants = [v.strip() for v in self._dv.get().split(",") if v.strip()]
         if not word or not variants:
             return
-        dictionary[word] = variants
-        save_dictionary(dictionary)
-        self._dw.delete(0, "end"); self._dv.delete(0, "end")
+
+        if self._editing_word is not None:
+            # Update existing entry
+            dictionary[self._editing_word] = variants
+            save_dictionary(dictionary)
+            self._append_log("sys", f"словарь: обновлено '{self._editing_word}' ({len(variants)} вариантов)")
+            self._dict_cancel_edit()
+        else:
+            dictionary[word] = variants
+            save_dictionary(dictionary)
+            self._dw.delete(0, "end"); self._dv.delete(0, "end")
+            self._append_log("sys", f"словарь: добавлено '{word}' ({len(variants)} вариантов)")
         self._refresh_dict()
-        self._append_log("sys", f"словарь: добавлено '{word}' ({len(variants)} вариантов)")
 
     def _dict_delete(self, word: str):
         dictionary.pop(word, None)
@@ -655,6 +746,14 @@ class WhisperApp(ctk.CTk):
         # ── Модель ──
         section("Модель")
 
+        self._s_whisper_model = ctk.StringVar(value=self.settings.get("whisper_model", "turbo"))
+        def whisper_model_w(r):
+            vsoption(r, self._s_whisper_model,
+                     ["tiny", "base", "small", "medium", "large-v2", "large-v3", "turbo"],
+                     width=160).pack(side="left")
+        setting_row("Whisper модель", whisper_model_w,
+                    "turbo = быстро и точно / large-v3 = максимум точности")
+
         self._s_device = ctk.StringVar(value=self.settings["device"])
         def device_w(r):
             vsoption(r, self._s_device, ["cuda", "cpu"]).pack(side="left")
@@ -677,15 +776,17 @@ class WhisperApp(ctk.CTk):
 
     def _apply_settings(self):
         reload = (self._s_device.get()  != self.settings["device"] or
-                  self._s_compute.get() != self.settings["compute"])
+                  self._s_compute.get() != self.settings["compute"] or
+                  self._s_whisper_model.get() != self.settings.get("whisper_model", "turbo"))
         new_hk = self._s_hotkey.get().strip()
         self.settings.update({
-            "hotkey":    new_hk,
-            "language":  self._s_lang.get(),
-            "beam_size": int(self._s_beam.get()),
-            "min_dur":   round(self._s_min_dur.get(), 1),
-            "device":    self._s_device.get(),
-            "compute":   self._s_compute.get(),
+            "hotkey":        new_hk,
+            "language":      self._s_lang.get(),
+            "beam_size":     int(self._s_beam.get()),
+            "min_dur":       round(self._s_min_dur.get(), 1),
+            "device":        self._s_device.get(),
+            "compute":       self._s_compute.get(),
+            "whisper_model": self._s_whisper_model.get(),
         })
         self._save_settings()
         self._register_hotkey(new_hk)
@@ -754,14 +855,15 @@ class WhisperApp(ctk.CTk):
     def _load_model_thread(self):
         try:
             from faster_whisper import WhisperModel
-            m = WhisperModel("turbo",
+            model_name = self.settings.get("whisper_model", "turbo")
+            m = WhisperModel(model_name,
                              device=self.settings["device"],
                              compute_type=self.settings["compute"])
             self.model = m
             self.after(0, lambda: self._model_lbl.configure(
                 text="✓ модель готова", text_color=C["green"]))
-            self.after(0, lambda: self._append_log(
-                "sys", f"модель загружена  [{self.settings['device']} / "
+            self.after(0, lambda mn=model_name: self._append_log(
+                "sys", f"модель загружена  [{mn} / {self.settings['device']} / "
                        f"{self.settings['compute']}]"))
         except Exception as e:
             self.after(0, lambda: self._model_lbl.configure(
@@ -891,6 +993,9 @@ class WhisperApp(ctk.CTk):
                 no_repeat_ngram_size=3,
             )
             text = "".join([s.text for s in segments]).strip()
+            # Убираем лишнюю точку в конце (артефакт Whisper)
+            if text.endswith(".") and not text.endswith("..."):
+                text = text[:-1].rstrip()
             text = apply_dictionary(text)
 
             if text:
