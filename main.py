@@ -49,6 +49,7 @@ C = {
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DICT_FILE  = os.path.join(SCRIPT_DIR, "dictionary.json")
 SET_FILE   = os.path.join(SCRIPT_DIR, "settings.json")
+LOG_FILE   = os.path.join(SCRIPT_DIR, "transcription_log.json")
 
 # ══════════════════════════════════════════════════════════════════════
 #  ОПРЕДЕЛЕНИЕ ЯЗЫКА ПО РАСКЛАДКЕ WINDOWS
@@ -104,6 +105,26 @@ def load_dictionary() -> dict:
 def save_dictionary(d: dict):
     with open(DICT_FILE, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=2)
+
+# ══════════════════════════════════════════════════════════════════════
+#  ПОСТОЯННЫЕ ЛОГИ
+# ══════════════════════════════════════════════════════════════════════
+
+def load_log() -> list:
+    if os.path.exists(LOG_FILE):
+        try:
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+def save_log(entries: list):
+    try:
+        with open(LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(entries, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 dictionary: dict = load_dictionary()
 
@@ -206,8 +227,14 @@ class WhisperApp(ctk.CTk):
         self._tray_rec      = False
         self._tray_running  = True
         self._current_tab   = "log"
-        self._log_entries   = []
+        self._log_entries   = load_log()   # загружаем постоянные логи
         self._editing_word  = None
+
+        # Микрофон — мониторинг
+        self._mic_level     = 0.0          # 0.0 … 1.0
+        self._mic_monitor_running = False
+        self._mic_monitor_thread  = None
+        self._mic_device_index    = None   # None = системный по умолчанию
 
         LANG_LABELS = {
             "auto":             "🌐 Авто (Whisper)",
@@ -241,6 +268,7 @@ class WhisperApp(ctk.CTk):
         self._build_ui()
         self._register_hotkey()
         self._load_model_async()
+        self._start_mic_monitor()
         self._animate()
 
     # ── Настройки ────────────────────────────────────────────────────
@@ -249,7 +277,7 @@ class WhisperApp(ctk.CTk):
         d = {"hotkey": "win+ctrl", "language": "auto",
              "beam_size": 5, "min_dur": 0.5,
              "device": "cuda", "compute": "float16",
-             "whisper_model": "turbo"}
+             "whisper_model": "turbo", "mic_device_index": None}
         if os.path.exists(SET_FILE):
             with open(SET_FILE, "r", encoding="utf-8") as f:
                 d.update(json.load(f))
@@ -325,6 +353,55 @@ class WhisperApp(ctk.CTk):
         self._lang_btns_frame.pack(fill="x", padx=8, pady=(4, 0))
         self._build_lang_buttons()
 
+        vsep(self.sidebar).pack(fill="x", padx=8, pady=(12, 6))
+        lbl(self.sidebar, "УСТРОЙСТВО ВВОДА", 10, color=C["text_faint"], bold=True).pack(anchor="w", padx=12)
+
+        # Комбо выбора микрофона
+        self._mic_var = ctk.StringVar(value="По умолчанию")
+        self._mic_combo = ctk.CTkOptionMenu(
+            self.sidebar, variable=self._mic_var,
+            values=["По умолчанию"],
+            width=220,
+            font=ctk.CTkFont("Consolas", 11),
+            fg_color=C["input"], button_color=C["input"],
+            button_hover_color=C["active"],
+            dropdown_fg_color=C["panel"],
+            dropdown_hover_color=C["active"],
+            text_color=C["text"], dropdown_text_color=C["text"],
+            corner_radius=6,
+            command=self._on_mic_selected)
+        self._mic_combo.pack(fill="x", padx=8, pady=(4, 2))
+        self._refresh_mic_list()
+
+        # Уровень сигнала
+        lbl(self.sidebar, "Уровень сигнала", 10, color=C["text_faint"]).pack(anchor="w", padx=12, pady=(6, 2))
+        self._mic_bar_canvas = ctk.CTkCanvas(
+            self.sidebar, height=14, bg=C["sidebar"],
+            highlightthickness=0)
+        self._mic_bar_canvas.pack(fill="x", padx=8, pady=(0, 2))
+        self._mic_bar_canvas.bind("<Configure>", self._redraw_mic_bar)
+
+        self._mic_db_lbl = lbl(self.sidebar, "– dB", 10, color=C["text_faint"])
+        self._mic_db_lbl.pack(anchor="w", padx=12)
+
+        # Громкость микрофона (Windows only)
+        lbl(self.sidebar, "Усиление входа", 10, color=C["text_faint"]).pack(anchor="w", padx=12, pady=(8, 2))
+        self._mic_vol_var = ctk.DoubleVar(value=100.0)
+        mic_vol_row = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        mic_vol_row.pack(fill="x", padx=8, pady=(0, 4))
+        self._mic_vol_slider = ctk.CTkSlider(
+            mic_vol_row, from_=0, to=100,
+            variable=self._mic_vol_var,
+            button_color=C["accent"],
+            button_hover_color="#9b7fd4",
+            progress_color="#6a4f9f",
+            fg_color=C["input"],
+            command=self._on_mic_vol_change)
+        self._mic_vol_slider.pack(side="left", fill="x", expand=True)
+        self._mic_vol_lbl = lbl(mic_vol_row, "100%", 10, color=C["accent3"], width=38)
+        self._mic_vol_lbl.pack(side="left", padx=(4, 0))
+        self._load_mic_volume()
+
         ctk.CTkFrame(self.sidebar, fg_color="transparent").pack(fill="y", expand=True)
         lbl(self.sidebar, "Whisper Voice  ", 9,
             color=C["text_faint"]).pack(pady=(0, 8), anchor="e")
@@ -336,33 +413,26 @@ class WhisperApp(ctk.CTk):
         self.main = ctk.CTkFrame(self, fg_color=C["bg"], corner_radius=0)
         self.main.pack(side="left", fill="both", expand=True)
 
-        # Tab bar
-        self.tabbar = ctk.CTkFrame(self.main, height=42, fg_color=C["sidebar"],
-                                    corner_radius=0)
-        self.tabbar.pack(fill="x")
-        self.tabbar.pack_propagate(False)
-        vsep(self.tabbar).pack(side="bottom", fill="x")
-
-        self._tab_labels = {}
-        for title, key in [("Лог транскрибаций", "log"),
-                            ("Словарь", "dict"),
-                            ("Настройки", "settings")]:
-            f = ctk.CTkFrame(self.tabbar, fg_color="transparent", cursor="hand2")
-            f.pack(side="left")
-            lb = ctk.CTkLabel(f, text=title,
-                               font=ctk.CTkFont("Consolas", 13),
-                               text_color=C["text_faint"],
-                               padx=18, pady=10, cursor="hand2")
-            lb.pack()
-            for w in (f, lb):
-                w.bind("<Button-1>", lambda e, k=key: self._switch_tab(k))
-            self._tab_labels[key] = (f, lb)
-
         # Страницы
         self._pages = {}
         self._build_log_page()
         self._build_dict_page()
         self._build_settings_page()
+
+        # Восстанавливаем сохранённые логи в UI
+        for entry in self._log_entries:
+            lang, now, text = entry
+            is_sys = lang in ("sys", "ERR")
+            if not is_sys:
+                self._total_count += 1
+                self._total_words += len(text.split())
+            self._render_log_row(lang, now, text)
+        self._sb_count.configure(text=str(self._total_count))
+        self._sb_words.configure(text=str(self._total_words))
+        if self._log_entries:
+            last = [e for e in self._log_entries if e[0] not in ("sys", "ERR")]
+            if last:
+                self._sb_lang.configure(text=last[-1][0].upper())
 
         # Статус-бар
         self.statusbar = ctk.CTkFrame(self, height=28,
@@ -442,8 +512,7 @@ class WhisperApp(ctk.CTk):
             scrollbar_button_color=C["input"],
             scrollbar_button_hover_color=C["active"])
         self._log_scroll.pack(fill="both", expand=True)
-        # Keep a list of (lang, text) for copy-all
-        self._log_entries = []
+        # NOTE: _log_entries already loaded in __init__ from disk
 
     def _append_log(self, lang: str, text: str):
         now    = datetime.now().strftime("%H:%M:%S")
@@ -456,7 +525,15 @@ class WhisperApp(ctk.CTk):
             self._sb_lang.configure(text=lang.upper())
 
         self._log_entries.append((lang, now, text))
+        save_log(self._log_entries)
 
+        self._render_log_row(lang, now, text)
+        # Auto-scroll
+        self._log_scroll._parent_canvas.yview_moveto(1.0)
+
+    def _render_log_row(self, lang: str, now: str, text: str):
+        """Render one log row in the scrollable frame."""
+        is_sys = lang in ("sys", "ERR")
         # Row container
         row = ctk.CTkFrame(self._log_scroll, fg_color="transparent", corner_radius=4)
         row.pack(fill="x", padx=4, pady=1)
@@ -516,6 +593,7 @@ class WhisperApp(ctk.CTk):
         for w in self._log_scroll.winfo_children():
             w.destroy()
         self._log_entries.clear()
+        save_log(self._log_entries)
         self._total_count = 0; self._total_words = 0
         self._sb_count.configure(text="0")
         self._sb_words.configure(text="0")
@@ -814,12 +892,6 @@ class WhisperApp(ctk.CTk):
         for k, lb in self._act_btns.items():
             lb.configure(text_color=C["text"] if k == key else C["text_faint"])
 
-        for k, (f, lb) in self._tab_labels.items():
-            active = k == key
-            lb.configure(
-                text_color=C["text"]    if active else C["text_faint"],
-                fg_color=C["bg"]        if active else "transparent")
-
         if key == "log":
             self._stat_frame.pack(fill="x", padx=8, pady=(0, 8))
         else:
@@ -892,6 +964,163 @@ class WhisperApp(ctk.CTk):
             self.after(0, lambda: self._append_log("ERR", f"хоткей: {e}"))
 
     # ══════════════════════════════════════════════════════════════════
+    #  МИКРОФОН — ВЫБОР УСТРОЙСТВА, МОНИТОРИНГ, ГРОМКОСТЬ
+    # ══════════════════════════════════════════════════════════════════
+
+    def _get_input_devices(self) -> list[tuple[int, str]]:
+        """Return list of (index, name) for all input devices."""
+        p = pyaudio.PyAudio()
+        devices = []
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            if info.get("maxInputChannels", 0) > 0:
+                devices.append((i, info["name"]))
+        p.terminate()
+        return devices
+
+    def _refresh_mic_list(self):
+        devices = self._get_input_devices()
+        names = ["По умолчанию"] + [f"{i}: {n}" for i, n in devices]
+        self._mic_combo.configure(values=names)
+        saved_idx = self.settings.get("mic_device_index")
+        if saved_idx is not None:
+            for i, n in devices:
+                if i == saved_idx:
+                    self._mic_var.set(f"{i}: {n}")
+                    self._mic_device_index = saved_idx
+                    break
+
+    def _on_mic_selected(self, choice: str):
+        if choice == "По умолчанию":
+            self._mic_device_index = None
+            self.settings["mic_device_index"] = None
+        else:
+            idx = int(choice.split(":")[0])
+            self._mic_device_index = idx
+            self.settings["mic_device_index"] = idx
+        self._save_settings()
+        self._restart_mic_monitor()
+
+    def _start_mic_monitor(self):
+        self._mic_monitor_running = True
+        self._mic_monitor_thread = threading.Thread(
+            target=self._mic_monitor_loop, daemon=True)
+        self._mic_monitor_thread.start()
+        self._update_mic_bar()
+
+    def _restart_mic_monitor(self):
+        self._mic_monitor_running = False
+        time.sleep(0.05)
+        self._mic_monitor_running = True
+        self._mic_monitor_thread = threading.Thread(
+            target=self._mic_monitor_loop, daemon=True)
+        self._mic_monitor_thread.start()
+
+    def _mic_monitor_loop(self):
+        CHUNK = 1024
+        p = pyaudio.PyAudio()
+        try:
+            kw = {}
+            if self._mic_device_index is not None:
+                kw["input_device_index"] = self._mic_device_index
+            stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000,
+                            input=True, frames_per_buffer=CHUNK, **kw)
+            while self._mic_monitor_running:
+                try:
+                    data = stream.read(CHUNK, exception_on_overflow=False)
+                    samples = [int.from_bytes(data[i:i+2], "little", signed=True)
+                               for i in range(0, len(data), 2)]
+                    rms = math.sqrt(sum(s*s for s in samples) / len(samples)) if samples else 0
+                    # Convert to 0..1 log scale (silence ≈ 0, loud ≈ 1)
+                    if rms > 0:
+                        db = 20 * math.log10(rms / 32768)  # dB relative to full scale
+                        db = max(db, -60)
+                        level = (db + 60) / 60  # -60dB→0, 0dB→1
+                    else:
+                        db = -60
+                        level = 0.0
+                    self._mic_level = level
+                    self._mic_db = db
+                except Exception:
+                    self._mic_level = 0.0
+                    self._mic_db = -60
+            stream.stop_stream()
+            stream.close()
+        except Exception:
+            self._mic_level = 0.0
+            self._mic_db = -60
+        finally:
+            p.terminate()
+
+    def _update_mic_bar(self):
+        if not self._tray_running:
+            return
+        self._redraw_mic_bar()
+        try:
+            db = getattr(self, "_mic_db", -60)
+            self._mic_db_lbl.configure(text=f"{db:.1f} dB")
+        except Exception:
+            pass
+        self.after(60, self._update_mic_bar)
+
+    def _redraw_mic_bar(self, event=None):
+        try:
+            c = self._mic_bar_canvas
+            w = c.winfo_width()
+            h = c.winfo_height()
+            if w < 2:
+                return
+            c.delete("all")
+            level = getattr(self, "_mic_level", 0.0)
+            # Background track
+            c.create_rectangle(0, 0, w, h, fill=C["input"], outline="")
+            # Coloured fill — green→yellow→red
+            fill_w = int(w * min(level, 1.0))
+            if fill_w > 0:
+                if level < 0.5:
+                    col = C["green"]
+                elif level < 0.8:
+                    col = C["yellow"]
+                else:
+                    col = C["red"]
+                c.create_rectangle(0, 0, fill_w, h, fill=col, outline="")
+            # Peak marker
+            peak = getattr(self, "_mic_peak", 0.0)
+            # Decay peak
+            self._mic_peak = max(level, getattr(self, "_mic_peak", 0.0) * 0.95)
+            px = int(w * min(self._mic_peak, 1.0))
+            if px > 2:
+                c.create_rectangle(px-2, 0, px, h, fill="white", outline="")
+        except Exception:
+            pass
+
+    def _load_mic_volume(self):
+        """Load current system mic volume (Windows)."""
+        try:
+            from ctypes import cast, POINTER
+            from comtypes import CLSCTX_ALL
+            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+            devices = AudioUtilities.GetMicrophone()
+            interface = devices.Activate(IAudioEndpointVolume._iid_,
+                                          CLSCTX_ALL, None)
+            self._audio_endpoint = cast(interface, POINTER(IAudioEndpointVolume))
+            vol = self._audio_endpoint.GetMasterVolumeLevelScalar()
+            pct = round(vol * 100)
+            self._mic_vol_var.set(pct)
+            self._mic_vol_lbl.configure(text=f"{pct}%")
+        except Exception:
+            self._audio_endpoint = None
+
+    def _on_mic_vol_change(self, val):
+        pct = int(float(val))
+        self._mic_vol_lbl.configure(text=f"{pct}%")
+        try:
+            if self._audio_endpoint:
+                self._audio_endpoint.SetMasterVolumeLevelScalar(pct / 100.0, None)
+        except Exception:
+            pass
+
+    # ══════════════════════════════════════════════════════════════════
     #  ЗАПИСЬ И ТРАНСКРИБАЦИЯ
     # ══════════════════════════════════════════════════════════════════
 
@@ -902,8 +1131,12 @@ class WhisperApp(ctk.CTk):
         CHUNK, FORMAT, CHANNELS, RATE = 1024, pyaudio.paInt16, 1, 16000
         p            = pyaudio.PyAudio()
         sample_width = p.get_sample_size(FORMAT)
+        open_kw = {}
+        if self._mic_device_index is not None:
+            open_kw["input_device_index"] = self._mic_device_index
         stream       = p.open(format=FORMAT, channels=CHANNELS,
-                               rate=RATE, input=True, frames_per_buffer=CHUNK)
+                               rate=RATE, input=True, frames_per_buffer=CHUNK,
+                               **open_kw)
         frames     = []
         start_time = time.time()
 
@@ -1051,6 +1284,7 @@ class WhisperApp(ctk.CTk):
 
     def _quit_app(self):
         self._tray_running = False
+        self._mic_monitor_running = False
         try: self._tray_icon.stop()
         except Exception: pass
         self.after(0, self.destroy)
