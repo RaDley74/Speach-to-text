@@ -268,6 +268,7 @@ class WhisperApp(ctk.CTk):
         self._build_ui()
         self._register_hotkey()
         self._load_model_async()
+        self._update_model_buttons()
         self._start_mic_monitor()
         self._animate()
 
@@ -337,7 +338,26 @@ class WhisperApp(ctk.CTk):
 
         self._model_lbl = lbl(self.sidebar, "⟳ загрузка...", 12,
                                color=C["yellow"])
-        self._model_lbl.pack(anchor="w", padx=12, pady=(8, 4))
+        self._model_lbl.pack(anchor="w", padx=12, pady=(8, 2))
+
+        # ── Load / Unload model buttons ───────────────────────────────
+        _model_btn_row = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        _model_btn_row.pack(fill="x", padx=8, pady=(0, 4))
+        self._btn_load_model = ctk.CTkButton(
+            _model_btn_row, text="▶ Загрузить", width=104, height=26,
+            font=ctk.CTkFont("Consolas", 11),
+            fg_color=C["accent"], hover_color="#9b7fd4",
+            text_color=C["bg"], corner_radius=5, border_width=0,
+            command=self._load_model_async)
+        self._btn_load_model.pack(side="left", padx=(0, 4))
+        self._btn_unload_model = ctk.CTkButton(
+            _model_btn_row, text="■ Выгрузить", width=104, height=26,
+            font=ctk.CTkFont("Consolas", 11),
+            fg_color=C["input"], hover_color=C["active"],
+            text_color=C["text"], corner_radius=5, border_width=0,
+            state="disabled",
+            command=self._unload_model)
+        self._btn_unload_model.pack(side="left")
 
         self._rec_lbl = lbl(self.sidebar, "● ожидание", 12,
                              color=C["text_faint"])
@@ -373,15 +393,33 @@ class WhisperApp(ctk.CTk):
         self._mic_combo.pack(fill="x", padx=8, pady=(4, 2))
         self._refresh_mic_list()
 
-        # Уровень сигнала
-        lbl(self.sidebar, "Уровень сигнала", 10, color=C["text_faint"]).pack(anchor="w", padx=12, pady=(6, 2))
+        # Уровень сигнала — заголовок с кнопкой скрытия
+        _sig_hdr = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        _sig_hdr.pack(fill="x", padx=8, pady=(6, 0))
+        lbl(_sig_hdr, "Уровень сигнала", 10, color=C["text_faint"]).pack(side="left", padx=4)
+        self._sig_visible = True
+        self._btn_sig_toggle = ctk.CTkLabel(
+            _sig_hdr, text="▾", width=20,
+            font=ctk.CTkFont("Consolas", 13),
+            text_color=C["text_faint"], cursor="hand2")
+        self._btn_sig_toggle.pack(side="left", padx=(2, 0))
+        self._btn_sig_toggle.bind("<Button-1>", lambda e: self._toggle_signal_level())
+        self._btn_sig_toggle.bind("<Enter>", lambda e: self._btn_sig_toggle.configure(text_color=C["text"]))
+        self._btn_sig_toggle.bind("<Leave>", lambda e: self._btn_sig_toggle.configure(text_color=C["text_faint"]))
+
+        # Контейнер секции — внешний фрейм всегда в layout, внутренний скрывается
+        self._sig_outer = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        self._sig_outer.pack(fill="x")
+        self._sig_section = ctk.CTkFrame(self._sig_outer, fg_color="transparent")
+        self._sig_section.pack(fill="x")
+
         self._mic_bar_canvas = ctk.CTkCanvas(
-            self.sidebar, height=14, bg=C["sidebar"],
+            self._sig_section, height=14, bg=C["sidebar"],
             highlightthickness=0)
-        self._mic_bar_canvas.pack(fill="x", padx=8, pady=(0, 2))
+        self._mic_bar_canvas.pack(fill="x", padx=8, pady=(2, 2))
         self._mic_bar_canvas.bind("<Configure>", self._redraw_mic_bar)
 
-        self._mic_db_lbl = lbl(self.sidebar, "– dB", 10, color=C["text_faint"])
+        self._mic_db_lbl = lbl(self._sig_section, "– dB", 10, color=C["text_faint"])
         self._mic_db_lbl.pack(anchor="w", padx=12)
 
         # Громкость микрофона (Windows only)
@@ -426,7 +464,7 @@ class WhisperApp(ctk.CTk):
             if not is_sys:
                 self._total_count += 1
                 self._total_words += len(text.split())
-            self._render_log_row(lang, now, text)
+            # self._render_log_row(lang, now, text)
         self._sb_count.configure(text=str(self._total_count))
         self._sb_words.configure(text=str(self._total_words))
         if self._log_entries:
@@ -919,9 +957,20 @@ class WhisperApp(ctk.CTk):
     #  МОДЕЛЬ
     # ══════════════════════════════════════════════════════════════════
 
+    def _toggle_signal_level(self):
+        """Show/hide the signal level bar and dB label."""
+        self._sig_visible = not self._sig_visible
+        if self._sig_visible:
+            self._sig_section.pack(in_=self._sig_outer, fill="x")
+            self._btn_sig_toggle.configure(text="▾")
+        else:
+            self._sig_section.pack_forget()
+            self._btn_sig_toggle.configure(text="▸")
+
     def _load_model_async(self):
         self.model = None
         self._model_lbl.configure(text="⟳ загрузка...", text_color=C["yellow"])
+        self._update_model_buttons()
         threading.Thread(target=self._load_model_thread, daemon=True).start()
 
     def _load_model_thread(self):
@@ -937,10 +986,42 @@ class WhisperApp(ctk.CTk):
             self.after(0, lambda mn=model_name: self._append_log(
                 "sys", f"модель загружена  [{mn} / {self.settings['device']} / "
                        f"{self.settings['compute']}]"))
+            self.after(0, self._update_model_buttons)
         except Exception as e:
             self.after(0, lambda: self._model_lbl.configure(
                 text="✗ ошибка", text_color=C["red"]))
             self.after(0, lambda: self._append_log("ERR", str(e)))
+            self.after(0, self._update_model_buttons)
+
+    def _unload_model(self):
+        if self.model is None:
+            return
+        self.model = None
+        import gc
+        gc.collect()
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        self._model_lbl.configure(text="○ модель выгружена", text_color=C["text_faint"])
+        self._append_log("sys", "модель выгружена из памяти")
+        self._update_model_buttons()
+
+    def _update_model_buttons(self):
+        """Refresh Load/Unload button states based on model status."""
+        try:
+            loaded = self.model is not None
+            self._btn_load_model.configure(
+                state="disabled" if loaded else "normal",
+                fg_color=C["input"] if loaded else C["accent"],
+                hover_color=C["active"] if loaded else "#9b7fd4")
+            self._btn_unload_model.configure(
+                state="normal" if loaded else "disabled",
+                fg_color=C["red"] if loaded else C["input"],
+                hover_color="#c00" if loaded else C["active"])
+        except Exception:
+            pass
 
     # ══════════════════════════════════════════════════════════════════
     #  ХОТКЕЙ
@@ -1016,78 +1097,40 @@ class WhisperApp(ctk.CTk):
             target=self._mic_monitor_loop, daemon=True)
         self._mic_monitor_thread.start()
 
-    def _hotkey_held(self) -> bool:
-        """Return True if all hotkey keys are currently pressed."""
-        try:
-            keys = [k.strip() for k in
-                    self.settings["hotkey"].replace("+", " ").split()]
-            return all(keyboard.is_pressed(k) for k in keys)
-        except Exception:
-            return False
-
     def _mic_monitor_loop(self):
         CHUNK = 1024
         p = pyaudio.PyAudio()
-        stream = None
-
-        def _open_stream():
+        try:
             kw = {}
             if self._mic_device_index is not None:
                 kw["input_device_index"] = self._mic_device_index
-            return p.open(format=pyaudio.paInt16, channels=1, rate=16000,
-                          input=True, frames_per_buffer=CHUNK, **kw)
-
-        try:
+            stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000,
+                            input=True, frames_per_buffer=CHUNK, **kw)
             while self._mic_monitor_running:
-                if self._hotkey_held() and not self.recording:
-                    # Open stream lazily on first press (but not while transcription is recording)
-                    if stream is None:
-                        try:
-                            stream = _open_stream()
-                        except Exception:
-                            time.sleep(0.05)
-                            continue
-                    try:
-                        data = stream.read(CHUNK, exception_on_overflow=False)
-                        samples = [int.from_bytes(data[i:i+2], "little", signed=True)
-                                   for i in range(0, len(data), 2)]
-                        rms = math.sqrt(sum(s*s for s in samples) / len(samples)) if samples else 0
-                        # Convert to 0..1 log scale (silence ≈ 0, loud ≈ 1)
-                        if rms > 0:
-                            db = 20 * math.log10(rms / 32768)  # dB relative to full scale
-                            db = max(db, -60)
-                            level = (db + 60) / 60  # -60dB→0, 0dB→1
-                        else:
-                            db = -60
-                            level = 0.0
-                        self._mic_level = level
-                        self._mic_db = db
-                    except Exception:
-                        self._mic_level = 0.0
-                        self._mic_db = -60
-                else:
-                    # Hotkey not held (or transcription is actively recording) — close stream and reset level to zero
-                    if stream is not None:
-                        try:
-                            stream.stop_stream()
-                            stream.close()
-                        except Exception:
-                            pass
-                        stream = None
-                        self._mic_peak = 0.0
+                try:
+                    data = stream.read(CHUNK, exception_on_overflow=False)
+                    samples = [int.from_bytes(data[i:i+2], "little", signed=True)
+                               for i in range(0, len(data), 2)]
+                    rms = math.sqrt(sum(s*s for s in samples) / len(samples)) if samples else 0
+                    # Convert to 0..1 log scale (silence ≈ 0, loud ≈ 1)
+                    if rms > 0:
+                        db = 20 * math.log10(rms / 32768)  # dB relative to full scale
+                        db = max(db, -60)
+                        level = (db + 60) / 60  # -60dB→0, 0dB→1
+                    else:
+                        db = -60
+                        level = 0.0
+                    self._mic_level = level
+                    self._mic_db = db
+                except Exception:
                     self._mic_level = 0.0
                     self._mic_db = -60
-                    time.sleep(0.03)
+            stream.stop_stream()
+            stream.close()
         except Exception:
             self._mic_level = 0.0
             self._mic_db = -60
         finally:
-            if stream is not None:
-                try:
-                    stream.stop_stream()
-                    stream.close()
-                except Exception:
-                    pass
             p.terminate()
 
     def _update_mic_bar(self):
