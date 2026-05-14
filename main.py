@@ -1016,40 +1016,78 @@ class WhisperApp(ctk.CTk):
             target=self._mic_monitor_loop, daemon=True)
         self._mic_monitor_thread.start()
 
+    def _hotkey_held(self) -> bool:
+        """Return True if all hotkey keys are currently pressed."""
+        try:
+            keys = [k.strip() for k in
+                    self.settings["hotkey"].replace("+", " ").split()]
+            return all(keyboard.is_pressed(k) for k in keys)
+        except Exception:
+            return False
+
     def _mic_monitor_loop(self):
         CHUNK = 1024
         p = pyaudio.PyAudio()
-        try:
+        stream = None
+
+        def _open_stream():
             kw = {}
             if self._mic_device_index is not None:
                 kw["input_device_index"] = self._mic_device_index
-            stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000,
-                            input=True, frames_per_buffer=CHUNK, **kw)
+            return p.open(format=pyaudio.paInt16, channels=1, rate=16000,
+                          input=True, frames_per_buffer=CHUNK, **kw)
+
+        try:
             while self._mic_monitor_running:
-                try:
-                    data = stream.read(CHUNK, exception_on_overflow=False)
-                    samples = [int.from_bytes(data[i:i+2], "little", signed=True)
-                               for i in range(0, len(data), 2)]
-                    rms = math.sqrt(sum(s*s for s in samples) / len(samples)) if samples else 0
-                    # Convert to 0..1 log scale (silence ≈ 0, loud ≈ 1)
-                    if rms > 0:
-                        db = 20 * math.log10(rms / 32768)  # dB relative to full scale
-                        db = max(db, -60)
-                        level = (db + 60) / 60  # -60dB→0, 0dB→1
-                    else:
-                        db = -60
-                        level = 0.0
-                    self._mic_level = level
-                    self._mic_db = db
-                except Exception:
+                if self._hotkey_held() and not self.recording:
+                    # Open stream lazily on first press (but not while transcription is recording)
+                    if stream is None:
+                        try:
+                            stream = _open_stream()
+                        except Exception:
+                            time.sleep(0.05)
+                            continue
+                    try:
+                        data = stream.read(CHUNK, exception_on_overflow=False)
+                        samples = [int.from_bytes(data[i:i+2], "little", signed=True)
+                                   for i in range(0, len(data), 2)]
+                        rms = math.sqrt(sum(s*s for s in samples) / len(samples)) if samples else 0
+                        # Convert to 0..1 log scale (silence ≈ 0, loud ≈ 1)
+                        if rms > 0:
+                            db = 20 * math.log10(rms / 32768)  # dB relative to full scale
+                            db = max(db, -60)
+                            level = (db + 60) / 60  # -60dB→0, 0dB→1
+                        else:
+                            db = -60
+                            level = 0.0
+                        self._mic_level = level
+                        self._mic_db = db
+                    except Exception:
+                        self._mic_level = 0.0
+                        self._mic_db = -60
+                else:
+                    # Hotkey not held (or transcription is actively recording) — close stream and reset level to zero
+                    if stream is not None:
+                        try:
+                            stream.stop_stream()
+                            stream.close()
+                        except Exception:
+                            pass
+                        stream = None
+                        self._mic_peak = 0.0
                     self._mic_level = 0.0
                     self._mic_db = -60
-            stream.stop_stream()
-            stream.close()
+                    time.sleep(0.03)
         except Exception:
             self._mic_level = 0.0
             self._mic_db = -60
         finally:
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception:
+                    pass
             p.terminate()
 
     def _update_mic_bar(self):
