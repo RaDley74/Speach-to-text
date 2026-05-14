@@ -145,17 +145,38 @@ def get_hot_words() -> list:
 #  ТРЕЙ
 # ══════════════════════════════════════════════════════════════════════
 
-def make_tray_icon(phase: float, recording: bool) -> Image.Image:
+def make_tray_icon(phase: float, recording: bool,
+                   model_state: str = "ready") -> Image.Image:
+    """model_state: 'ready' | 'loading' | 'unloaded'"""
     img  = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    if not recording:
-        draw.ellipse([22, 22, 42, 42], fill=(100, 100, 100, 200))
-    else:
+    if recording:
+        # Пульсирующий синий круг — запись
         r = 18 + int(math.sin(phase) * 5)
         t = (math.sin(phase) + 1) / 2
         col = (int(0 + 100 * t), int(122 + 50 * t), 204)
         draw.ellipse([32-r, 32-r, 32+r, 32+r], outline=col, width=2)
         draw.ellipse([20, 20, 44, 44], fill=(0, 122, 204, 230))
+    elif model_state == "unloaded":
+        # Серый круг с крестиком — модель выгружена
+        draw.ellipse([16, 16, 48, 48], fill=(80, 80, 80, 200))
+        draw.line([26, 26, 38, 38], fill=(200, 80, 80, 255), width=3)
+        draw.line([38, 26, 26, 38], fill=(200, 80, 80, 255), width=3)
+    elif model_state == "loading":
+        # Вращающаяся дуга — загрузка
+        t = (math.sin(phase * 1.5) + 1) / 2
+        brightness = int(180 + 75 * t)
+        draw.ellipse([14, 14, 50, 50], outline=(80, 80, 80, 120), width=4)
+        import math as _m
+        start_angle = (phase * 60) % 360
+        draw.arc([14, 14, 50, 50], start=start_angle,
+                 end=start_angle + 240,
+                 fill=(brightness, int(180 * t + 80), 255, 230), width=4)
+        # Маленький круг в центре
+        draw.ellipse([27, 27, 37, 37], fill=(100, 150, 220, 180))
+    else:
+        # Обычный серый — ожидание, модель готова
+        draw.ellipse([22, 22, 42, 42], fill=(100, 100, 100, 200))
     return img
 
 # ══════════════════════════════════════════════════════════════════════
@@ -224,7 +245,8 @@ class WhisperApp(ctk.CTk):
         self.settings       = self._load_settings()
         self._total_count   = 0
         self._total_words   = 0
-        self._tray_rec      = False
+        self._tray_rec        = False
+        self._tray_model_state = "loading"  # 'loading' | 'ready' | 'unloaded'
         self._tray_running  = True
         self._current_tab   = "log"
         self._log_entries   = load_log()   # загружаем постоянные логи
@@ -255,14 +277,7 @@ class WhisperApp(ctk.CTk):
 
         self._tray_icon = Icon(
             "whisper", make_tray_icon(0, False), "Whisper Voice",
-            menu=Menu(
-                MenuItem("Открыть", lambda item: self._show_from_tray()),
-                Menu.SEPARATOR,
-                MenuItem("Язык", Menu(
-                    *[make_lang_item(c, l) for c, l in LANG_LABELS.items()]
-                )),
-                Menu.SEPARATOR,
-                MenuItem("Выход", lambda item: self._quit_app())))
+            menu=Menu(self._build_tray_menu))
         threading.Thread(target=self._tray_thread, daemon=True).start()
 
         self._build_ui()
@@ -969,6 +984,7 @@ class WhisperApp(ctk.CTk):
 
     def _load_model_async(self):
         self.model = None
+        self._tray_model_state = "loading"
         self._model_lbl.configure(text="⟳ загрузка...", text_color=C["yellow"])
         self._update_model_buttons()
         threading.Thread(target=self._load_model_thread, daemon=True).start()
@@ -981,6 +997,7 @@ class WhisperApp(ctk.CTk):
                              device=self.settings["device"],
                              compute_type=self.settings["compute"])
             self.model = m
+            self._tray_model_state = "ready"
             self.after(0, lambda: self._model_lbl.configure(
                 text="✓ модель готова", text_color=C["green"]))
             self.after(0, lambda mn=model_name: self._append_log(
@@ -988,6 +1005,7 @@ class WhisperApp(ctk.CTk):
                        f"{self.settings['compute']}]"))
             self.after(0, self._update_model_buttons)
         except Exception as e:
+            self._tray_model_state = "unloaded"
             self.after(0, lambda: self._model_lbl.configure(
                 text="✗ ошибка", text_color=C["red"]))
             self.after(0, lambda: self._append_log("ERR", str(e)))
@@ -1004,9 +1022,44 @@ class WhisperApp(ctk.CTk):
             torch.cuda.empty_cache()
         except Exception:
             pass
+        self._tray_model_state = "unloaded"
         self._model_lbl.configure(text="○ модель выгружена", text_color=C["text_faint"])
         self._append_log("sys", "модель выгружена из памяти")
         self._update_model_buttons()
+
+    def _build_tray_menu(self):
+        """Dynamically build tray menu — called by pystray on every open."""
+        loaded = self.model is not None
+        LANG_LABELS = {
+            "auto":            "🌐 Авто (Whisper)",
+            "keyboard_layout": "⌨️  По раскладке",
+            "ru":              "🇷🇺 Русский",
+            "uk":              "🇺🇦 Украинский",
+            "de":              "🇩🇪 Немецкий",
+            "en":              "🇬🇧 Английский",
+        }
+        def make_lang_item(code, label):
+            def action(item, c=code):
+                self._set_lang_from_tray(c)
+            def checked(item, c=code):
+                return self.settings.get("language") == c
+            return MenuItem(label, action, checked=checked, radio=True)
+        return (
+            MenuItem("Открыть", lambda item: self._show_from_tray()),
+            Menu.SEPARATOR,
+            MenuItem("Язык", Menu(
+                *[make_lang_item(c, l) for c, l in LANG_LABELS.items()]
+            )),
+            Menu.SEPARATOR,
+            MenuItem("Загрузить модель",
+                     lambda item: self.after(0, self._load_model_async),
+                     enabled=lambda item: self.model is None),
+            MenuItem("Выгрузить модель",
+                     lambda item: self.after(0, self._unload_model),
+                     enabled=lambda item: self.model is not None),
+            Menu.SEPARATOR,
+            MenuItem("Выход", lambda item: self._quit_app()),
+        )
 
     def _update_model_buttons(self):
         """Refresh Load/Unload button states based on model status."""
@@ -1020,6 +1073,10 @@ class WhisperApp(ctk.CTk):
                 state="normal" if loaded else "disabled",
                 fg_color=C["red"] if loaded else C["input"],
                 hover_color="#c00" if loaded else C["active"])
+        except Exception:
+            pass
+        try:
+            self._tray_icon.update_menu()
         except Exception:
             pass
 
@@ -1206,7 +1263,11 @@ class WhisperApp(ctk.CTk):
     # ══════════════════════════════════════════════════════════════════
 
     def _record_and_transcribe(self):
-        if not self.model or self.recording:
+        if self.recording:
+            return
+        if not self.model:
+            self._append_log("sys", "модель не загружена — запускаю загрузку...")
+            self._load_model_async()
             return
 
         CHUNK, FORMAT, CHANNELS, RATE = 1024, pyaudio.paInt16, 1, 16000
@@ -1347,12 +1408,20 @@ class WhisperApp(ctk.CTk):
         threading.Thread(target=self._tray_icon.run, daemon=True).start()
         phase = 0.0
         while self._tray_running:
+            ms = self._tray_model_state
             if self._tray_rec:
                 phase += 0.22
-                self._tray_icon.icon  = make_tray_icon(phase, True)
+                self._tray_icon.icon  = make_tray_icon(phase, True, ms)
                 self._tray_icon.title = "Whisper — запись..."
+            elif ms == "loading":
+                phase += 0.08
+                self._tray_icon.icon  = make_tray_icon(phase, False, "loading")
+                self._tray_icon.title = "Whisper — загрузка модели..."
+            elif ms == "unloaded":
+                self._tray_icon.icon  = make_tray_icon(0, False, "unloaded")
+                self._tray_icon.title = "Whisper — модель не загружена"
             else:
-                self._tray_icon.icon  = make_tray_icon(0, False)
+                self._tray_icon.icon  = make_tray_icon(0, False, "ready")
                 self._tray_icon.title = "Whisper Voice"
             time.sleep(0.03)
 
